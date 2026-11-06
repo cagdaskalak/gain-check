@@ -1,0 +1,5 @@
+{
+  "name": "gain-check",
+  "owner": { "name": "cagdaskalak" },
+  "plugins": [{ "name": "gain-check", "source": "./" }]
+}

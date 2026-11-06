@@ -1,0 +1,7 @@
+{
+  "name": "gain-check",
+  "version": "0.1.0",
+  "description": "A second read on any decision on your screen: what you get, what you don't, what you give up, and what you already have",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
