@@ -24,6 +24,7 @@ declare module 'claude-code' {
       showTools: boolean
       measured: Shaped<Cost[]>
       baseline: { usd: number; percent: number } | null
+      autoStop: boolean
     }
   }
 }

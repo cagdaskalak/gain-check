@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { costLine, costOf, estimateOf, parseAnswer, percentPerUsd } from './lib'
+import { costLine, costOf, estimateOf, parseAnswer, percentPerUsd, questionText, short } from './lib'
 
 const QUESTION = {
   plugin: 'gain-check',
@@ -95,8 +95,23 @@ const done = (id: string, subject: string, answer = ANSWER) => ({
   cost: { tokens: 300_000, usd: 0.31 },
 })
 
+const running = (id: string, subject: string) => ({
+  id,
+  source: 'test',
+  subject,
+  body: subject,
+  status: 'running',
+  startedAt: 1000,
+  agentId: `agent-${id}`,
+})
+
 // Stands for the engine beneath the mod and records what the check is handed.
-const engine = (on: any, opts: { selection?: string; override?: string; seed?: unknown[] } = {}) => {
+const engine = (
+  on: any,
+  opts: { selection?: string; override?: string; seed?: unknown[]; refuseStop?: boolean } = {},
+) => {
+  const stops: string[] = []
+  const saved: Record<string, unknown> = {}
   const spawned: any[] = []
   const specs: any[] = []
   const toasts: string[] = []
@@ -108,7 +123,18 @@ const engine = (on: any, opts: { selection?: string; override?: string; seed?: u
   on('command.register', () => ({ value: { command: 'gain' } }))
   on('session.root', () => ({ value: '/project' }))
   on('store.get', () => ({ value: undefined }))
-  on('store.set', () => ({ value: undefined }))
+  on('store.set', (_: any, e: any) => {
+    saved[e.key] = e.value
+
+    return { value: undefined }
+  })
+  on('tool.call', { tool: 'TaskStop' }, (_: any, e: any) => {
+    if (opts.refuseStop === true) return { deny: 'not allowed' }
+    stops.push(e.task_id)
+
+    return { result: {}, text: 'stopped' }
+  })
+  on('tool.call', { tool: 'AskUserQuestion' }, () => ({ result: {}, text: 'answered' }))
   on('fs.read', () => {
     if (opts.override === undefined) throw new Error('missing')
 
@@ -158,12 +184,23 @@ const engine = (on: any, opts: { selection?: string; override?: string; seed?: u
     return { model: 'm', agentId: 'a1' }
   })
   if (opts.seed !== undefined) {
+    // A real read-write stand-in for the seeded value, so a status change sticks.
+    let stored: unknown = { shape: 'checks-1', value: opts.seed }
+    let version = 1
     on('state.get', (_: any, e: any, next: any) =>
-      e.key === 'checks' ? { value: { value: { shape: 'checks-1', value: opts.seed }, version: 1 } } : next(e),
+      e.key === 'checks' ? { value: { value: stored, version } } : next(e),
     )
-  }
+    on('state.set', (_: any, e: any, next: any) => {
+      if (e.key !== 'checks') return next(e)
+      stored = e.value
+      version += 1
 
-  return { spawned, specs, toasts, placed, opened }
+      return { value: { isSet: true, version } }
+    })
+  }
+  on('ui.log', () => ({ value: undefined }))
+
+  return { spawned, specs, toasts, placed, opened, stops, saved }
 }
 
 const boot = ($: any) => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -513,4 +550,141 @@ test('an answer is split into its parts, and a line with no label continues the 
 test('a silent answer and a shapeless one are both kept readable', () => {
   expect(parseAnswer('Silent: docs only.').silent).toBe('docs only.')
   expect(parseAnswer('Something else entirely').other).toBe('Something else entirely')
+})
+
+test('a running check\'s chat card has a Stop button that stops that check', async ($: any, on: any) => {
+  const { stops } = engine(on, { seed: [running('c1', 'First'), running('c2', 'Second')] })
+  await boot($)
+  const ui = await $.ui.mount({
+    plugin: 'gain-check',
+    component: 'Placed',
+    requestId: 'card-c1',
+    props: { id: 'card-c1', plugin: 'gain-check' },
+    surface: 'terminal',
+  })
+
+  await ui.press({ key: 'stop-c1' })
+
+  expect(stops).toEqual(['agent-c1'])
+  await ui.unmount()
+})
+
+test('a finished check has no Stop button', async ($: any, on: any) => {
+  engine(on, { seed: [done('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  expect(await ui.find({ key: 'stop-c1' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the pane can stop the check you are looking at', async ($: any, on: any) => {
+  const { stops } = engine(on, { seed: [running('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  await ui.press({ key: 'stop-c1' })
+
+  expect(stops).toEqual(['agent-c1'])
+  await ui.unmount()
+
+  // Drawn again, as the engine does when a value changes: the stop stuck.
+  const after = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await after.find({ type: 'Text', text: /Stopped/ })).toBeDefined()
+  expect(await after.find({ key: 'stop-c1' })).toBeUndefined()
+  await after.unmount()
+})
+
+test('the band offers Stop all only while something is running, and it stops them all', async ($: any, on: any) => {
+  const { stops } = engine(on, { seed: [running('c1', 'First'), running('c2', 'Second'), done('c3', 'Third')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  await ui.press({ key: 'gain-stop-all' })
+
+  expect(stops).toEqual(['agent-c1', 'agent-c2'])
+  await ui.unmount()
+})
+
+test('the band has no Stop all when nothing is running', async ($: any, on: any) => {
+  engine(on, { seed: [done('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await ui.find({ key: 'gain-stop-all' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('answering a question stops the check on that question, and leaves others running', async ($: any, on: any) => {
+  const asked = short(questionText([QUESTION.props.questions[0]]), 100)
+  const { stops, toasts } = engine(on, { seed: [running('c1', asked), running('c2', 'Something else')] })
+  await boot($)
+
+  await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION.props.questions })
+
+  expect(stops).toEqual(['agent-c1'])
+  expect(toasts.join(' ')).toContain('Stopped 1 gain check,')
+})
+
+test('a check on the whole set of questions is stopped too', async ($: any, on: any) => {
+  const both = short(questionText(TWO.props.questions), 100)
+  const { stops } = engine(on, { seed: [running('c1', both)] })
+  await boot($)
+
+  await $.tool.call({ tool: 'AskUserQuestion', questions: TWO.props.questions })
+
+  expect(stops).toEqual(['agent-c1'])
+})
+
+test('the switch turns auto-stop off, says so, and is saved for next time', async ($: any, on: any) => {
+  const asked = short(questionText([QUESTION.props.questions[0]]), 100)
+  const { stops, saved } = engine(on, { seed: [running('c1', asked)] })
+  await boot($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  expect((await ui.find({ key: 'auto-stop' }))?.text).toContain('On')
+  await ui.press({ key: 'auto-stop' })
+  expect((await ui.find({ key: 'auto-stop' }))?.text).toContain('Off')
+  expect(saved.autoStop).toBe(false)
+  await ui.unmount()
+
+  await $.tool.call({ tool: 'AskUserQuestion', questions: QUESTION.props.questions })
+
+  expect(stops).toEqual([])
+})
+
+test('the question dialog has the switch too', async ($: any, on: any) => {
+  engine(on)
+  await boot($)
+  const ui = await $.ui.mount({ ...QUESTION, surface: 'terminal' })
+
+  expect((await ui.find({ key: 'auto-stop' }))?.text).toContain('On')
+  await ui.unmount()
+})
+
+test('a stop the engine refuses says so and leaves the check as it was', async ($: any, on: any) => {
+  const { toasts } = engine(on, { seed: [running('c1', 'First')], refuseStop: true })
+  await boot($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  await ui.press({ key: 'stop-c1' })
+
+  expect(toasts.join(' ')).toContain('Could not stop')
+  await ui.unmount()
+})
+
+test('a dialog with the most questions still fits and keeps its buttons', async ($: any, on: any) => {
+  engine(on)
+  await boot($)
+  const q = (header: string) => ({ ...QUESTION.props.questions[0], question: `${header}?`, header })
+  const ui = await $.ui.mount({
+    ...QUESTION,
+    props: { tool: 'AskUserQuestion', questions: [q('Database'), q('Timing'), q('Hosting'), q('Budget')] },
+    surface: 'terminal',
+  })
+
+  for (const key of ['gain-q0', 'gain-q3', 'gain-all', 'auto-stop']) {
+    expect(await ui.find({ key })).toBeDefined()
+  }
+  await ui.unmount()
 })

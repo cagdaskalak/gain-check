@@ -38,6 +38,15 @@ Each check gets a card in the chat. Click it to open the full answer in the side
 
 Pressing the same thing twice never runs it twice, and a finished answer opens again without paying for it. Up to 6 checks run at once.
 
+## Stopping a check
+
+A check you started keeps running until it finishes, unless you stop it:
+
+- **Stop:** every running check has a `Stop` button on its card, and `Stop all` sits next to the `Gain check` button.
+- **Stop checks when you answer:** when you answer or close a question, any check still running on that question stops by itself. Click the switch in the question dialog or the side pane to turn this off. It stays as you left it.
+
+Stopping saves what hasn't been spent yet, and you lose that answer, but you can always run it again.
+
 ## What it costs
 
 Every check is a real agent run, and the cost shows before you press:

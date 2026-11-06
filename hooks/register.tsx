@@ -37,6 +37,7 @@ const viewing = atom({ plugin: 'gain-check', key: 'viewing' } as const, null)
 const showTools = atom({ plugin: 'gain-check', key: 'showTools' } as const, false)
 const measured = atom({ plugin: 'gain-check', key: 'measured' } as const, [], { shape: 'measured-1' })
 const baseline = atom({ plugin: 'gain-check', key: 'baseline' } as const, null)
+const autoStop = atom({ plugin: 'gain-check', key: 'autoStop' } as const, true)
 
 const isLive = (c: GainCheck, now: number) => c.status === 'running' && now - c.startedAt < STALE_MS
 
@@ -80,6 +81,57 @@ const refresh = async ($: EngineInterface) => {
 
 const settle = ($: EngineInterface, id: string, patch: Partial<GainCheck>) =>
   update($, checks, list => list.map(c => (c.id === id ? { ...c, ...patch } : c)))
+
+// Asks the engine to stop the check's agent. Stopping saves what isn't spent yet;
+// the check can always be run again.
+const stopCheck = async ($: EngineInterface, c: GainCheck) => {
+  if (c.agentId === undefined) {
+    $.ui.toast('That check is still starting. Try again in a moment.')
+
+    return false
+  }
+
+  const stopped = await $.tool.call({ tool: 'TaskStop', task_id: c.agentId })
+
+  if ('deny' in stopped && stopped.deny !== undefined) {
+    $.ui.toast(`Could not stop that check: ${stopped.deny}`)
+
+    return false
+  }
+
+  await settle($, c.id, { status: 'stopped' })
+
+  return true
+}
+
+const stopMany = async ($: EngineInterface, list: readonly GainCheck[]) => {
+  let stopped = 0
+  for (const c of list) if (await stopCheck($, c)) stopped += 1
+
+  return stopped
+}
+
+const plural = (n: number) => `${n} gain check${n === 1 ? '' : 's'}`
+
+// The question closed, so a check still running on it no longer helps the decision.
+const stopForQuestions = async ($: EngineInterface, questions: readonly unknown[]) => {
+  const subjects = new Set([
+    short(questionText(questions), 100),
+    ...questions.map(q => short(questionText([q]), 100)),
+  ])
+  const now = await $.clock.now()
+  const live = (await read($, checks)).filter(c => isLive(c, now) && subjects.has(c.subject))
+  const stopped = await stopMany($, live)
+
+  if (stopped > 0) $.ui.toast(`Stopped ${plural(stopped)}, since you answered the question.`)
+}
+
+const toggleAutoStop = async ($: EngineInterface) => {
+  const next = !(await read($, autoStop))
+  await update($, autoStop, () => next)
+  await $.store.set('autoStop', next)
+  $.ui.toast(next ? 'Auto-stop is on.' : 'Auto-stop is off. Checks keep running after you answer.')
+}
 
 const openCheck = async ($: EngineInterface, id: string) => {
   await update($, viewing, () => id)
@@ -185,10 +237,18 @@ const LABEL_COLOR: Record<RowLabel, string> = {
 }
 
 const statusMark = (c: GainCheck) =>
-  c.status === 'running' ? '◐' : c.status === 'done' ? '✓' : '×'
+  c.status === 'running' ? '◐' : c.status === 'done' ? '✓' : c.status === 'stopped' ? '■' : '×'
 
 const statusColor = (c: GainCheck) =>
-  c.status === 'running' ? 'warning' : c.status === 'done' ? 'claude' : 'error'
+  c.status === 'running' ? 'warning' : c.status === 'done' ? 'claude' : c.status === 'stopped' ? 'subtle' : 'error'
+
+// The on/off switch: one click flips it, and it stays as you left it.
+const drawSwitch = ({ Button, Text }: Table, $: EngineInterface, isOn: boolean) => (
+  <Button key="auto-stop" plain onPress={() => toggleAutoStop($)}>
+    <Text dimColor>Stop checks when you answer: </Text>
+    <Text bold color={isOn ? 'success' : 'subtle'}>{isOn ? 'On' : 'Off'}</Text>
+  </Button>
+)
 
 // One card: a rounded frame with the same padding everywhere.
 const frame = ({ Box }: Table, color: string, children: unknown, dim = false) => (
@@ -213,14 +273,25 @@ const drawAnswer = (t: Table, c: GainCheck) => {
     )
   }
 
+  if (c.status === 'stopped') {
+    return frame(
+      t,
+      'subtle',
+      <Box flexDirection="column">
+        <Text bold>■ Stopped</Text>
+        <Text dimColor>{c.subject}</Text>
+      </Box>,
+    )
+  }
+
   if (c.status !== 'done') {
     return frame(
       t,
       'error',
       <Box flexDirection="column">
-        <Text bold color="error">× Check {c.status === 'stopped' ? 'stopped' : 'failed'}</Text>
+        <Text bold color="error">× Check failed</Text>
         <Text>{c.subject}</Text>
-        {c.status === 'failed' && c.answer !== undefined && <Text dimColor>{c.answer}</Text>}
+        {c.answer !== undefined && <Text dimColor>{c.answer}</Text>}
       </Box>,
     )
   }
@@ -329,6 +400,8 @@ export const register: Register = on => {
     // Real costs carry over between sessions, so the estimate stays honest.
     const saved = await $.store.get('measured')
     if (Array.isArray(saved)) await update($, measured, () => saved as Cost[])
+    const savedSwitch = await $.store.get('autoStop')
+    if (typeof savedSwitch === 'boolean') await update($, autoStop, () => savedSwitch)
 
     return started
   })
@@ -391,6 +464,22 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // When a question closes, however it closed, checks still running on it stop if the
+  // switch is on. A check that fails to stop must never get in the way of the answer.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    const result = await next(e)
+
+    if (e.agentId === undefined && (await read($, autoStop))) {
+      try {
+        await stopForQuestions($, e.questions)
+      } catch (error) {
+        $.ui.log(`gain-check: could not stop: ${String(error)}`, { to: 'debug' })
+      }
+    }
+
+    return result
+  })
+
   // Permission prompts are drawn by the engine alone and take no button, so they
   // are listed in the pane instead.
   on('classic.PermissionRequest', async ($, e, next) => {
@@ -413,7 +502,8 @@ export const register: Register = on => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
-    const running = (await read($, checks)).filter(c => isLive(c, now)).length
+    const live = (await read($, checks)).filter(c => isLive(c, now))
+    const running = live.length
     const { estimate, perUsd } = await estimateNow($)
 
     return (
@@ -428,6 +518,16 @@ export const register: Register = on => {
             }
           }}
         />
+        {running > 0 && (
+          <Button
+            key="gain-stop-all"
+            label="Stop all"
+            onPress={async () => {
+              const stopped = await stopMany($, live)
+              if (stopped > 0) $.ui.toast(`Stopped ${plural(stopped)}.`)
+            }}
+          />
+        )}
         {running > 0 ? (
           <Text color="warning"> ◐ {running} checking… </Text>
         ) : (
@@ -451,7 +551,9 @@ export const register: Register = on => {
     const note =
       c.status === 'running'
         ? 'Checking… usually 1 to 4 minutes.'
-        : p.silent ?? p.suggestion ?? (c.status === 'done' ? 'Answer ready.' : 'This check did not finish.')
+        : c.status === 'stopped'
+          ? 'Stopped.'
+          : p.silent ?? p.suggestion ?? (c.status === 'done' ? 'Answer ready.' : 'This check did not finish.')
 
     return frame(
       table,
@@ -462,6 +564,15 @@ export const register: Register = on => {
           {title}
         </Button>
         <Text dimColor>{note}</Text>
+        {c.status === 'running' && (
+          <Button
+            key={`stop-${c.id}`}
+            label="Stop"
+            onPress={async () => {
+              if (await stopCheck($, c)) $.ui.toast('Stopped.')
+            }}
+          />
+        )}
       </Box>,
     )
   })
@@ -473,6 +584,7 @@ export const register: Register = on => {
     const all = await read($, checks)
     const { estimate, perUsd } = await estimateNow($)
     const totalUsd = (estimate.usd ?? 0) * questions.length
+    const isAutoStop = await read($, autoStop)
 
     return (
       <Box flexDirection="column">
@@ -504,6 +616,7 @@ export const register: Register = on => {
             />
           )}
         </Box>
+        {drawSwitch($.ui.resolve(e), $, isAutoStop)}
         {node}
       </Box>
     )
@@ -521,11 +634,13 @@ export const register: Register = on => {
     const inner = Math.max(20, (e.props.bodyColumns ?? 60) - 6)
     const canSelect = e.viewport?.isFullscreen !== false
     const { estimate, perUsd, percentUsed } = await estimateNow($)
+    const isAutoStop = await read($, autoStop)
 
     return (
       <Box flexDirection="column">
         <Text dimColor>Each check: {costLine(estimate, perUsd)}</Text>
         {percentUsed !== undefined && <Text dimColor>5-hour limit: {percentUsed}% used so far</Text>}
+        {drawSwitch(table, $, isAutoStop)}
 
         {all.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
@@ -547,6 +662,15 @@ export const register: Register = on => {
         {current !== undefined && (
           <Box flexDirection="column" marginTop={1}>
             {drawAnswer(table, current)}
+            {current.status === 'running' && (
+              <Button
+                key={`stop-${current.id}`}
+                label="Stop this check"
+                onPress={async () => {
+                  if (await stopCheck($, current)) $.ui.toast('Stopped.')
+                }}
+              />
+            )}
             {current.status !== 'running' && (
               <Button
                 key="again"
