@@ -3,17 +3,21 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Cost, GainCheck, Moment } from '../types'
 import {
-  costLine,
+  autoDisplay,
   costOf,
+  costText,
   estimateOf,
+  FIELDS,
   lastUserWords,
+  meterOf,
   momentsFrom,
   parseAnswer,
   percentPerUsd,
   questionText,
   short,
+  timeOf,
 } from './lib'
-import type { RowLabel } from './lib'
+import type { Display, DisplayField, RowLabel } from './lib'
 import { DEFAULT_PROMPT, DEFAULT_TOOLS } from './prompt'
 
 const PANE = 'gain-check'
@@ -38,45 +42,95 @@ const showTools = atom({ plugin: 'gain-check', key: 'showTools' } as const, fals
 const measured = atom({ plugin: 'gain-check', key: 'measured' } as const, [], { shape: 'measured-1' })
 const baseline = atom({ plugin: 'gain-check', key: 'baseline' } as const, null)
 const autoStop = atom({ plugin: 'gain-check', key: 'autoStop' } as const, true)
+// The latest usage figures. The engine pushes them, so what is drawn stays current.
+const reading = atom({ plugin: 'gain-check', key: 'reading' } as const, null)
+// This project's own tick boxes; null means the standard setup for the account.
+const display = atom({ plugin: 'gain-check', key: 'display' } as const, null)
+const showSettings = atom({ plugin: 'gain-check', key: 'showSettings' } as const, false)
+// Questions already answered, for the moment before the transcript shows their answer.
+const closed = atom({ plugin: 'gain-check', key: 'closed' } as const, [])
+const showPast = atom({ plugin: 'gain-check', key: 'showPast' } as const, false)
+// The newest answer the person has opened; anything newer shows as ready.
+const seen = atom({ plugin: 'gain-check', key: 'seen' } as const, null)
 
 const isLive = (c: GainCheck, now: number) => c.status === 'running' && now - c.startedAt < STALE_MS
 
-// The live usage reading, as the two numbers the share of the limit is worked from.
-const readingOf = async ($: EngineInterface) => {
-  const usage = await $.session.usage()
-  const five = usage.rateLimits.find(r => r.kind === 'five_hour')
-  const usd = usage.cost?.usd
+// Stores the latest usage figures; every drawing that reads them redraws by itself.
+// A lower limit reading means the 5-hour window reset, so measuring starts again.
+const applyUsage = async (
+  $: EngineInterface,
+  rateLimits: readonly { kind: string; percentUsed: number; resetsAt?: string }[],
+  cost: { usd: number } | undefined,
+) => {
+  const five = rateLimits.find(r => r.kind === 'five_hour')
+  await update($, reading, () => ({
+    ...(cost === undefined ? {} : { usd: cost.usd }),
+    ...(five === undefined ? {} : { percent: five.percentUsed }),
+    ...(five?.resetsAt === undefined ? {} : { resetsAt: five.resetsAt }),
+  }))
 
-  return five === undefined || usd === undefined ? undefined : { usd, percent: five.percentUsed }
-}
-
-// Called from events, never while drawing. A lower reading means the 5-hour window
-// reset, so measuring starts again.
-const rememberBaseline = async ($: EngineInterface) => {
-  const now = await readingOf($)
-  if (now === undefined) return
+  if (five === undefined || cost === undefined) return
+  const now = { usd: cost.usd, percent: five.percentUsed }
   const base = await read($, baseline)
   if (base === null || now.percent < base.percent) await update($, baseline, () => now)
 }
 
-// What one more check is likely to cost, from real runs and the live usage reading.
+const syncUsage = async ($: EngineInterface) => {
+  const usage = await $.session.usage()
+  await applyUsage($, usage.rateLimits, usage.cost)
+}
+
+// What one more check is likely to cost, from real runs and the stored usage figures.
 const estimateNow = async ($: EngineInterface) => {
   const estimate: Cost = estimateOf(await read($, measured))
-  const now = await readingOf($)
+  const now = await read($, reading)
   const base = await read($, baseline)
 
   return {
     estimate,
-    perUsd: now === undefined || base === null ? undefined : percentPerUsd(base, now),
+    perUsd:
+      now?.usd === undefined || now.percent === undefined || base === null
+        ? undefined
+        : percentPerUsd(base, { usd: now.usd, percent: now.percent }),
     percentUsed: now?.percent,
+    resetsAt: timeOf(now?.resetsAt),
   }
+}
+
+// Limit figures only exist on a subscription, so they tell the two kinds of account apart.
+const displayNow = async ($: EngineInterface): Promise<Display & { isCustom: boolean; isSubscription: boolean }> => {
+  const isSubscription = (await read($, reading))?.percent !== undefined
+  const custom = await read($, display)
+
+  return { ...autoDisplay(isSubscription), ...custom, isCustom: custom !== null, isSubscription }
+}
+
+const displayKey = async ($: EngineInterface) => `display:${await $.session.root()}`
+
+const toggleField = async ($: EngineInterface, field: DisplayField) => {
+  const { dollars, share, tokens, limit, hint } = await displayNow($)
+  const current: Display = { dollars, share, tokens, limit, hint }
+  const next = { ...current, [field]: !current[field] }
+  await update($, display, () => next)
+  await $.store.set(await displayKey($), next)
+}
+
+const resetDisplay = async ($: EngineInterface) => {
+  await update($, display, () => null)
+  await $.store.delete(await displayKey($))
+}
+
+const openSettings = async ($: EngineInterface) => {
+  await update($, showSettings, () => true)
+  await $.ui.open({ id: PANE, title: TITLE })
 }
 
 const refresh = async ($: EngineInterface) => {
   const rows = await $.session.messages()
   const extra = await read($, asks)
-  await update($, moments, () => [...momentsFrom(rows), ...extra].slice(-16))
-  await rememberBaseline($)
+  const answered = await read($, closed)
+  await update($, moments, () => [...momentsFrom(rows, answered), ...extra].slice(-16))
+  await syncUsage($)
 }
 
 const settle = ($: EngineInterface, id: string, patch: Partial<GainCheck>) =>
@@ -114,16 +168,33 @@ const stopMany = async ($: EngineInterface, list: readonly GainCheck[]) => {
 const plural = (n: number) => `${n} gain check${n === 1 ? '' : 's'}`
 
 // The question closed, so a check still running on it no longer helps the decision.
+const subjectsOf = (questions: readonly unknown[]) =>
+  new Set([short(questionText(questions), 100), ...questions.map(q => short(questionText([q]), 100))])
+
 const stopForQuestions = async ($: EngineInterface, questions: readonly unknown[]) => {
-  const subjects = new Set([
-    short(questionText(questions), 100),
-    ...questions.map(q => short(questionText([q]), 100)),
-  ])
+  const subjects = subjectsOf(questions)
   const now = await $.clock.now()
   const live = (await read($, checks)).filter(c => isLive(c, now) && subjects.has(c.subject))
   const stopped = await stopMany($, live)
 
   if (stopped > 0) $.ui.toast(`Stopped ${plural(stopped)}, since you answered the question.`)
+}
+
+// The decision is made, so its question and finished checks are history: out of view,
+// not deleted, because those answers were paid for.
+const closeQuestion = async ($: EngineInterface, id: string, questions: readonly unknown[]) => {
+  if (await read($, autoStop)) await stopForQuestions($, questions)
+  const subjects = subjectsOf(questions)
+  await update($, checks, list =>
+    list.map(c => (subjects.has(c.subject) && c.status !== 'running' ? { ...c, past: true } : c)),
+  )
+  await update($, closed, list => [...list, id].slice(-50))
+  await refresh($)
+}
+
+// The person moved on, so whatever had finished is history. A running check stays.
+const retireFinished = async ($: EngineInterface) => {
+  await update($, checks, list => list.map(c => (c.status === 'running' ? c : { ...c, past: true })))
 }
 
 const toggleAutoStop = async ($: EngineInterface) => {
@@ -135,6 +206,7 @@ const toggleAutoStop = async ($: EngineInterface) => {
 
 const openCheck = async ($: EngineInterface, id: string) => {
   await update($, viewing, () => id)
+  await update($, seen, () => id)
   await $.ui.open({ id: PANE, title: TITLE })
 }
 
@@ -157,7 +229,7 @@ const runCheck = async ($: EngineInterface, subject: string, source: string, opt
     return false
   }
 
-  if (same?.status === 'done' && !force) {
+  if (same?.status === 'done' && same.past !== true && !force) {
     await openCheck($, same.id)
     if (!quiet) $.ui.toast('Already checked. Showing that answer.')
 
@@ -229,6 +301,13 @@ const checkSelection = async ($: EngineInterface) => {
 // The surface's element table; each surface's Box, Text and Button take these props.
 type Table = { Box: any; Text: any; Button: any }
 
+const LABEL_ICON: Record<RowLabel, string> = {
+  'You get': '+',
+  "You don't get": '○',
+  'You give up': '−',
+  'You already have': '✓',
+}
+
 const LABEL_COLOR: Record<RowLabel, string> = {
   'You get': 'success',
   "You don't get": 'warning',
@@ -242,11 +321,14 @@ const statusMark = (c: GainCheck) =>
 const statusColor = (c: GainCheck) =>
   c.status === 'running' ? 'warning' : c.status === 'done' ? 'claude' : c.status === 'stopped' ? 'subtle' : 'error'
 
+// A tick box, wide enough to see and hit. A terminal can't draw one character larger.
+const box = (isOn: boolean) => (isOn ? '[✓]' : '[ ]')
+
 // The on/off switch: one click flips it, and it stays as you left it.
 const drawSwitch = ({ Button, Text }: Table, $: EngineInterface, isOn: boolean) => (
   <Button key="auto-stop" plain onPress={() => toggleAutoStop($)}>
-    <Text dimColor>Stop checks when you answer: </Text>
-    <Text bold color={isOn ? 'success' : 'subtle'}>{isOn ? 'On' : 'Off'}</Text>
+    <Text bold color={isOn ? 'success' : 'subtle'}>{box(isOn)}  </Text>
+    Stop checks when I answer
   </Button>
 )
 
@@ -257,8 +339,43 @@ const frame = ({ Box }: Table, color: string, children: unknown, dim = false) =>
   </Box>
 )
 
+// The tick boxes: wide framed rows, one click flips one, saved for this project.
+const drawSettings = (
+  t: Table,
+  $: EngineInterface,
+  shown: Awaited<ReturnType<typeof displayNow>>,
+  inner: number,
+) => {
+  const { Box, Button, Text } = t
+
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text bold>Show on screen</Text>
+      {FIELDS.map(f =>
+        frame(
+          t,
+          shown[f.key] ? 'success' : 'subtle',
+          <Button key={`tick-${f.key}`} plain onPress={() => toggleField($, f.key)}>
+            <Text bold color={shown[f.key] ? 'success' : 'subtle'}>{box(shown[f.key])}  </Text>
+            {f.label.padEnd(Math.max(10, inner - 5))}
+          </Button>,
+          !shown[f.key],
+        ),
+      )}
+      <Text dimColor>
+        {shown.isCustom
+          ? 'Your choice, saved for this project.'
+          : `Set automatically for ${shown.isSubscription ? 'a subscription' : 'pay-as-you-go'}.`}
+      </Text>
+      {shown.isCustom && (
+        <Button key="tick-reset" label="Back to automatic" plain dimColor onPress={() => resetDisplay($)} />
+      )}
+    </Box>
+  )
+}
+
 // The whole answer, one card per part.
-const drawAnswer = (t: Table, c: GainCheck) => {
+const drawAnswer = (t: Table, c: GainCheck, spentText: string) => {
   const { Box, Text } = t
 
   if (c.status === 'running') {
@@ -268,7 +385,7 @@ const drawAnswer = (t: Table, c: GainCheck) => {
       <Box flexDirection="column">
         <Text bold color="warning">◐ Checking…</Text>
         <Text>{c.subject}</Text>
-        <Text dimColor>Usually 1 to 4 minutes. You can keep working.</Text>
+        <Text dimColor>This usually takes 1 to 4 minutes. You can keep working.</Text>
       </Box>,
     )
   }
@@ -297,7 +414,7 @@ const drawAnswer = (t: Table, c: GainCheck) => {
   }
 
   const p = parseAnswer(c.answer ?? '')
-  const spent = c.cost === undefined ? null : <Text dimColor>This check used {costLine(c.cost)}</Text>
+  const spent = spentText === '' ? null : <Text dimColor>This check used {spentText}</Text>
 
   if (p.silent !== undefined) {
     return (
@@ -306,7 +423,7 @@ const drawAnswer = (t: Table, c: GainCheck) => {
           t,
           'subtle',
           <Box flexDirection="column">
-            <Text bold>Nothing to add</Text>
+            <Text bold>– Nothing to add</Text>
             <Text dimColor>{c.subject}</Text>
             <Text>{p.silent}</Text>
           </Box>,
@@ -332,7 +449,10 @@ const drawAnswer = (t: Table, c: GainCheck) => {
           t,
           LABEL_COLOR[row.label],
           <Box flexDirection="column">
-            <Text bold color={LABEL_COLOR[row.label]}>{row.label}</Text>
+            <Box>
+              <Text color={LABEL_COLOR[row.label]}>{LABEL_ICON[row.label]} </Text>
+              <Text bold color={LABEL_COLOR[row.label]}>{row.label}</Text>
+            </Box>
             <Text>{row.value}</Text>
           </Box>,
         ),
@@ -342,7 +462,10 @@ const drawAnswer = (t: Table, c: GainCheck) => {
           t,
           'permission',
           <Box flexDirection="column">
-            <Text bold color="permission">Suggestion</Text>
+            <Box>
+              <Text color="permission">→ </Text>
+              <Text bold color="permission">Suggestion</Text>
+            </Box>
             <Text>{p.suggestion}</Text>
           </Box>,
         )}
@@ -351,14 +474,14 @@ const drawAnswer = (t: Table, c: GainCheck) => {
   )
 }
 
-// One glyph and one colour per kind, so a card reads at a glance.
-const glyphOf = (kind: string) => {
-  if (kind === 'Question') return { glyph: '?', color: 'warning' }
-  if (kind === 'Permission') return { glyph: '!', color: 'error' }
-  if (kind === 'You') return { glyph: '›', color: 'suggestion' }
-  if (kind === 'Claude') return { glyph: '‹', color: 'claude' }
+// One colour per kind, so a card reads at a glance.
+const colorOf = (kind: string) => {
+  if (kind === 'Question') return 'warning'
+  if (kind === 'Permission') return 'error'
+  if (kind === 'You') return 'suggestion'
+  if (kind === 'Claude') return 'claude'
 
-  return { glyph: '·', color: 'subtle' }
+  return 'subtle'
 }
 
 const isToolRow = (m: Moment) => !['Question', 'Permission', 'You', 'Claude'].includes(m.kind)
@@ -402,6 +525,9 @@ export const register: Register = on => {
     if (Array.isArray(saved)) await update($, measured, () => saved as Cost[])
     const savedSwitch = await $.store.get('autoStop')
     if (typeof savedSwitch === 'boolean') await update($, autoStop, () => savedSwitch)
+    await syncUsage($)
+    const savedDisplay = await $.store.get(await displayKey($))
+    if (savedDisplay !== undefined && savedDisplay !== null) await update($, display, () => savedDisplay as Display)
 
     return started
   })
@@ -426,6 +552,13 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: TITLE })
 
     return { text: 'Nothing selected, so pick something in the Gain check pane.' }
+  })
+
+  // The engine pushes usage after each turn and whenever a limit moves a whole point.
+  on('session.measure', async ($, e, next) => {
+    await applyUsage($, e.rateLimits, e.cost)
+
+    return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
@@ -457,6 +590,7 @@ export const register: Register = on => {
           await $.store.set('measured', list)
         }
 
+        await syncUsage($)
         $.ui.toast('Gain check ready.')
       }
     }
@@ -467,17 +601,39 @@ export const register: Register = on => {
   // When a question closes, however it closed, checks still running on it stop if the
   // switch is on. A check that fails to stop must never get in the way of the answer.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId === undefined) await refresh($)
     const result = await next(e)
 
-    if (e.agentId === undefined && (await read($, autoStop))) {
+    if (e.agentId === undefined) {
       try {
-        await stopForQuestions($, e.questions)
+        await closeQuestion($, e.tool_use_id, e.questions)
       } catch (error) {
-        $.ui.log(`gain-check: could not stop: ${String(error)}`, { to: 'debug' })
+        $.ui.log(`gain-check: could not close the question: ${String(error)}`, { to: 'debug' })
       }
     }
 
     return result
+  })
+
+  // A permission prompt is over once its tool call is over.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+
+    if (e.agentId === undefined && (await read($, asks)).length > 0) {
+      await update($, asks, () => [])
+      await refresh($)
+    }
+
+    return result
+  })
+
+  // A message from the person means they moved on, typed here or sent from their phone.
+  // A slash command doesn't, and neither does a background notification waking the session.
+  on('prompt.submit', async ($, e, next) => {
+    const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (isPerson && e.command === undefined) await retireFinished($)
+
+    return next(e)
   })
 
   // Permission prompts are drawn by the engine alone and take no button, so they
@@ -502,15 +658,19 @@ export const register: Register = on => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
-    const live = (await read($, checks)).filter(c => isLive(c, now))
-    const running = live.length
-    const { estimate, perUsd } = await estimateNow($)
+    const all = await read($, checks)
+    const live = all.filter(c => isLive(c, now))
+    const latestDone = all.filter(c => c.status === 'done' && c.past !== true).at(-1)
+    const isReady = latestDone !== undefined && latestDone.id !== (await read($, seen))
+    const { estimate, perUsd, percentUsed } = await estimateNow($)
+    const shown = await displayNow($)
+    const costed = costText(estimate, perUsd, shown)
 
     return (
       <Box>
         <Button
           key="gain-band"
-          label="Gain check"
+          label="✦ Gain check"
           onPress={async () => {
             if (!(await checkSelection($))) {
               await refresh($)
@@ -518,22 +678,27 @@ export const register: Register = on => {
             }
           }}
         />
-        {running > 0 && (
+        {live.length > 0 && <Text color="warning"> ◐ Checking{live.length > 1 ? ` ${live.length}` : ''}… </Text>}
+        {live.length > 0 && (
           <Button
             key="gain-stop-all"
-            label="Stop all"
+            label={live.length > 1 ? 'Stop all' : 'Stop'}
+            dimColor
             onPress={async () => {
               const stopped = await stopMany($, live)
               if (stopped > 0) $.ui.toast(`Stopped ${plural(stopped)}.`)
             }}
           />
         )}
-        {running > 0 ? (
-          <Text color="warning"> ◐ {running} checking… </Text>
-        ) : (
-          <Text dimColor> select text first, or click to pick · </Text>
+        {live.length === 0 && isReady && <Text color="success"> ✓ Answer ready </Text>}
+        {live.length === 0 && isReady && (
+          <Button key="gain-open" label="Open" onPress={() => openCheck($, latestDone.id)} />
         )}
-        <Text dimColor>each {costLine(estimate, perUsd)}</Text>
+        {live.length === 0 && !isReady && shown.hint && <Text dimColor> Select text, then click</Text>}
+        {costed !== '' && <Text dimColor>  ·  {costed}</Text>}
+        {shown.limit && percentUsed !== undefined && <Text dimColor>  ·  {percentUsed}% used</Text>}
+        <Text>  </Text>
+        <Button key="gain-settings" label="⚙ Settings" dimColor onPress={() => openSettings($)} />
       </Box>
     )
   })
@@ -548,12 +713,30 @@ export const register: Register = on => {
     const { Box, Button, Text } = table
     const p = parseAnswer(c.answer ?? '')
     const title = c.status === 'done' && p.decision !== undefined ? p.decision : c.subject
+
+    // History: one quiet line, still a click away from its full answer.
+    if (c.past === true) {
+      return (
+        <Button
+          key={`open-${c.id}`}
+          plain
+          dimColor
+          onPress={async () => {
+            await update($, showPast, () => true)
+            await openCheck($, c.id)
+          }}
+        >
+          {statusMark(c)} {title}
+        </Button>
+      )
+    }
+
     const note =
       c.status === 'running'
         ? 'Checking… usually 1 to 4 minutes.'
         : c.status === 'stopped'
           ? 'Stopped.'
-          : p.silent ?? p.suggestion ?? (c.status === 'done' ? 'Answer ready.' : 'This check did not finish.')
+          : p.silent ?? p.suggestion ?? (c.status === 'done' ? 'Your answer is ready.' : 'This check did not finish.')
 
     return frame(
       table,
@@ -564,6 +747,7 @@ export const register: Register = on => {
           {title}
         </Button>
         <Text dimColor>{note}</Text>
+        {c.status === 'done' && <Text dimColor>Click the title to see the full answer.</Text>}
         {c.status === 'running' && (
           <Button
             key={`stop-${c.id}`}
@@ -583,16 +767,22 @@ export const register: Register = on => {
     const questions = e.props.questions
     const all = await read($, checks)
     const { estimate, perUsd } = await estimateNow($)
-    const totalUsd = (estimate.usd ?? 0) * questions.length
+    const shown = await displayNow($)
+    const costed = costText(estimate, perUsd, shown)
+    const totalCost = costText(
+      { tokens: estimate.tokens * questions.length, ...(estimate.usd === undefined ? {} : { usd: estimate.usd * questions.length }) },
+      perUsd,
+      shown,
+    )
     const isAutoStop = await read($, autoStop)
 
     return (
       <Box flexDirection="column">
-        <Text dimColor>Gain check · each {costLine(estimate, perUsd)}</Text>
+        <Text dimColor>✦ Gain check{costed === '' ? '' : ` · ${costed} each`}</Text>
         <Box flexWrap="wrap">
           {questions.map((q, i) => {
             const subject = questionText([q])
-            const mine = all.filter(c => c.subject === short(subject, 100)).at(-1)
+            const mine = all.filter(c => c.subject === short(subject, 100) && c.past !== true).at(-1)
             const header = String((q as { header?: unknown }).header ?? `Question ${i + 1}`)
             const mark = mine?.status === 'running' ? ' ◐' : mine?.status === 'done' ? ' ✓' : ''
 
@@ -610,7 +800,7 @@ export const register: Register = on => {
           {questions.length > 1 && (
             <Button
               key="gain-all"
-              label={`All ${questions.length} · $${totalUsd.toFixed(2)}`}
+              label={`All ${questions.length}${totalCost === '' ? '' : ` · ${totalCost}`}`}
               hotkey="a"
               onPress={() => runMany($, questions)}
             />
@@ -626,30 +816,66 @@ export const register: Register = on => {
     const table = $.ui.resolve(e)
     const { Box, Button, Text } = table
     const all = await read($, checks)
-    const seen = await read($, viewing)
-    const current = all.find(c => c.id === seen) ?? all.at(-1)
+    const viewedId = await read($, viewing)
+    const isPastOpen = await read($, showPast)
+    const active = all.filter(c => c.past !== true)
+    const pastCount = all.length - active.length
+    const visible = isPastOpen ? all : active
+    const current = visible.find(c => c.id === viewedId) ?? active.at(-1) ?? (isPastOpen ? all.at(-1) : undefined)
     const withTools = await read($, showTools)
     const list = (await read($, moments)).filter(m => withTools || !isToolRow(m))
     // Padded to the card's width so a click anywhere on its line lands on the button.
     const inner = Math.max(20, (e.props.bodyColumns ?? 60) - 6)
     const canSelect = e.viewport?.isFullscreen !== false
-    const { estimate, perUsd, percentUsed } = await estimateNow($)
+    const { estimate, perUsd, percentUsed, resetsAt } = await estimateNow($)
     const isAutoStop = await read($, autoStop)
+    const shown = await displayNow($)
+    const costed = costText(estimate, perUsd, shown)
+    const isSettingsOpen = await read($, showSettings)
+    const hasLimit = shown.limit && percentUsed !== undefined
 
     return (
       <Box flexDirection="column">
-        <Text dimColor>Each check: {costLine(estimate, perUsd)}</Text>
-        {percentUsed !== undefined && <Text dimColor>5-hour limit: {percentUsed}% used so far</Text>}
+        <Text dimColor>A second opinion on any decision on your screen.</Text>
+        {(hasLimit || costed !== '') && (
+          <Box marginTop={1} flexDirection="column">
+            {frame(
+              table,
+              'subtle',
+              <Box flexDirection="column">
+                {hasLimit && <Text>5-hour limit  {meterOf(percentUsed ?? 0)} {percentUsed}%</Text>}
+                {hasLimit && resetsAt !== undefined && <Text dimColor>Resets {resetsAt}</Text>}
+                {costed !== '' && <Text>Each check  {costed}</Text>}
+              </Box>,
+              true,
+            )}
+          </Box>
+        )}
         {drawSwitch(table, $, isAutoStop)}
+        <Box marginTop={1}>
+          <Button
+            key="show-settings"
+            label={isSettingsOpen ? '⚙ Hide settings' : '⚙ Settings'}
+            onPress={() => update($, showSettings, open => !open)}
+          />
+        </Box>
+        {isSettingsOpen && drawSettings(table, $, shown, inner)}
 
-        {all.length > 0 && (
+        {visible.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>Your checks</Text>
-            {[...all].reverse().slice(0, 6).map(c =>
+            {[...visible].reverse().slice(0, 6).map(c =>
               frame(
                 table,
                 statusColor(c),
-                <Button key={`check-${c.id}`} plain onPress={() => update($, viewing, () => c.id)}>
+                <Button
+                  key={`check-${c.id}`}
+                  plain
+                  onPress={async () => {
+                    await update($, viewing, () => c.id)
+                    await update($, seen, () => c.id)
+                  }}
+                >
                   <Text bold={c.id === current?.id} color={statusColor(c)}>{statusMark(c)} </Text>
                   {short(c.subject, inner - 2).padEnd(inner - 2)}
                 </Button>,
@@ -659,9 +885,19 @@ export const register: Register = on => {
           </Box>
         )}
 
+        {pastCount > 0 && (
+          <Button
+            key="show-past"
+            label={isPastOpen ? 'Hide past checks' : `Past checks (${pastCount})`}
+            plain
+            dimColor
+            onPress={() => update($, showPast, open => !open)}
+          />
+        )}
+
         {current !== undefined && (
           <Box flexDirection="column" marginTop={1}>
-            {drawAnswer(table, current)}
+            {drawAnswer(table, current, current.cost === undefined ? '' : costText(current.cost, perUsd, shown, false))}
             {current.status === 'running' && (
               <Button
                 key={`stop-${current.id}`}
@@ -711,7 +947,8 @@ export const register: Register = on => {
           .slice(-8)
           .reverse()
           .map(moment => {
-            const { glyph, color } = glyphOf(moment.kind)
+            const color = colorOf(moment.kind)
+            const room = Math.max(10, inner - moment.kind.length - 2)
 
             return frame(
               table,
@@ -721,8 +958,8 @@ export const register: Register = on => {
                 plain
                 onPress={() => runCheck($, moment.text, `${moment.kind} moment from the session`)}
               >
-                <Text color={color}>{glyph} </Text>
-                {short(moment.text, inner - 2).padEnd(inner - 2)}
+                <Text bold color={color}>{moment.kind}  </Text>
+                {short(moment.text, room).padEnd(room)}
               </Button>,
               true,
             )

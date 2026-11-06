@@ -12,6 +12,7 @@ export type GainCheck = {
   answer?: string
   agentId?: string
   cost?: Cost
+  past?: boolean
 }
 
 declare module 'claude-code' {
@@ -25,6 +26,12 @@ declare module 'claude-code' {
       measured: Shaped<Cost[]>
       baseline: { usd: number; percent: number } | null
       autoStop: boolean
+      reading: { usd?: number; percent?: number; resetsAt?: string } | null
+      seen: string | null
+      display: { dollars: boolean; share: boolean; tokens: boolean; limit: boolean; hint: boolean } | null
+      showSettings: boolean
+      closed: string[]
+      showPast: boolean
     }
   }
 }

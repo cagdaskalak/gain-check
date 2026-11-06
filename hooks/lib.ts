@@ -41,9 +41,20 @@ export const questionText = (questions: readonly unknown[]) =>
 // Task notifications are user-role rows the person did not write.
 const isPersonWords = (text: string) => text !== '' && !text.startsWith('<')
 
-export const momentsFrom = (rows: readonly SessionMessage[]): Moment[] => {
+// What can still be decided: the person's latest message and everything after it. An
+// answered question is history, so it leaves the list.
+export const momentsFrom = (rows: readonly SessionMessage[], answered: readonly string[] = []): Moment[] => {
   const out: Moment[] = []
-  const start = Math.max(0, rows.length - 40)
+  let start = Math.max(0, rows.length - 40)
+
+  for (let i = rows.length - 1; i >= start; i -= 1) {
+    const row = rows[i]
+
+    if (row?.role === 'user' && isPersonWords(row.text.trim())) {
+      start = i
+      break
+    }
+  }
 
   for (let i = start; i < rows.length; i += 1) {
     const row = rows[i]
@@ -54,6 +65,9 @@ export const momentsFrom = (rows: readonly SessionMessage[]): Moment[] => {
     }
 
     for (const use of row.toolUses ?? []) {
+      const isAnswered = use.result !== undefined || use.text !== undefined || answered.includes(use.tool_use_id)
+      if (use.tool === 'AskUserQuestion' && isAnswered) continue
+
       out.push(
         use.tool === 'AskUserQuestion'
           ? {
@@ -207,11 +221,50 @@ export const percentPerUsd = (
 const tokensLabel = (n: number) =>
   n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M` : `${Math.round(n / 1000)}k`
 
-export const costLine = (c: Cost, perUsd?: number) =>
-  [
-    `about ${tokensLabel(c.tokens)} tokens`,
-    ...(c.usd === undefined ? [] : [`$${c.usd.toFixed(2)} at API prices`]),
-    ...(c.usd === undefined || perUsd === undefined
-      ? []
-      : [`${(c.usd * perUsd).toFixed(1)}% of your 5-hour limit`]),
-  ].join(' · ')
+// ---- what shows on screen ----
+
+export type DisplayField = 'dollars' | 'share' | 'tokens' | 'limit' | 'hint'
+export type Display = Record<DisplayField, boolean>
+
+export const FIELDS: readonly { key: DisplayField; label: string }[] = [
+  { key: 'share', label: 'Share of my limit per check' },
+  { key: 'dollars', label: 'Dollar price' },
+  { key: 'tokens', label: 'Token count' },
+  { key: 'limit', label: 'How much of my limit is used' },
+  { key: 'hint', label: 'The hint on the bar' },
+]
+
+// The standard setup. On a subscription dollars aren't charged, so the limit is what
+// matters; pay-as-you-go has no limit to show, so dollars are what matters.
+export const autoDisplay = (isSubscription: boolean): Display => ({
+  dollars: !isSubscription,
+  share: isSubscription,
+  tokens: false,
+  limit: isSubscription,
+  hint: true,
+})
+
+// The cost, showing only what is ticked; empty when nothing ticked can be worked out.
+export const costText = (c: Cost, perUsd: number | undefined, show: Display, isEstimate = true) => {
+  const parts = [
+    ...(show.dollars && c.usd !== undefined ? [`$${c.usd.toFixed(2)}`] : []),
+    ...(show.share && c.usd !== undefined && perUsd !== undefined ? [`${(c.usd * perUsd).toFixed(1)}% of limit`] : []),
+    ...(show.tokens ? [`${tokensLabel(c.tokens)} tokens`] : []),
+  ]
+  if (parts.length === 0) return ''
+
+  return `${isEstimate ? '≈ ' : ''}${parts.join(' · ')}`
+}
+
+export const meterOf = (percent: number, cells = 10) => {
+  const filled = Math.min(cells, Math.max(0, Math.round((percent / 100) * cells)))
+
+  return '▰'.repeat(filled) + '▱'.repeat(cells - filled)
+}
+
+export const timeOf = (iso: string | undefined) => {
+  if (iso === undefined) return undefined
+  const d = new Date(iso)
+
+  return Number.isNaN(d.getTime()) ? undefined : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+}

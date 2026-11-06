@@ -38,12 +38,16 @@ Each check gets a card in the chat. Click it to open the full answer in the side
 
 Pressing the same thing twice never runs it twice, and a finished answer opens again without paying for it. Up to 6 checks run at once.
 
+## It follows where you are
+
+Once a decision is made, it stops taking up your screen. An answered question leaves the list, along with any finished check on it. Your next message does the same for other finished checks, and the list only offers your latest message and what follows. Nothing is deleted: `Past checks` in the side pane brings them back, because you paid for those answers, and a past check's card in the chat shrinks to one line you can still click.
+
 ## Stopping a check
 
 A check you started keeps running until it finishes, unless you stop it:
 
 - **Stop:** every running check has a `Stop` button on its card, and `Stop all` sits next to the `Gain check` button.
-- **Stop checks when you answer:** when you answer or close a question, any check still running on that question stops by itself. Click the switch in the question dialog or the side pane to turn this off. It stays as you left it.
+- **Stop checks when I answer:** when you answer or close a question, any check still running on that question stops by itself. Click the box in the question dialog or the side pane to turn this off. It stays as you left it.
 
 Stopping saves what hasn't been spent yet, and you lose that answer, but you can always run it again.
 
@@ -52,11 +56,20 @@ Stopping saves what hasn't been spent yet, and you lose that answer, but you can
 Every check is a real agent run, and the cost shows before you press:
 
 ```
-each about 700k tokens · $1.20 at API prices · 0.6% of your 5-hour limit
+[ ✦ Gain check ]  Select text, then click  ·  ≈ 0.2% of limit  ·  31% used  [ ⚙ Settings ]
 ```
 
+The numbers stay current by themselves as your usage moves.
+
+## Choose what shows
+
+Click `⚙ Settings` for tick boxes: share of your limit per check, dollar price, token count, how much of your limit is used, and the hint on the bar.
+
+- **Standard setup:** it follows your account. On a subscription you see your limit and no dollars, because you aren't charged per check. On pay-as-you-go you see dollars, because there is no limit to show.
+- **Your choice:** one click flips a box, and it's saved for that project, so each project can have its own setup. `Back to automatic` returns to the standard one.
+
 - The first number is a rough starting point. From your first finished check on, it is the average of your last 5 real runs.
-- "API prices" is what the tokens would cost on the API. On a subscription you pay no dollars, but the usage counts against your limit.
+- The dollar price is what the tokens would cost at API list prices. On a subscription you pay no dollars, but the usage counts against your limit.
 - The share of your 5-hour limit appears once enough usage has moved to measure it. Other sessions on your account count too, so it can read a little high.
 
 ## Limits
