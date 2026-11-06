@@ -1087,3 +1087,126 @@ test('the settings are a proper button with wide tick rows', async ($: any, on: 
   expect((row?.text.length ?? 0) > 60).toBe(true)
   await ui.unmount()
 })
+
+// The whole button takes the colour, brackets included, so it reads across the room.
+const bandFace = (ui: any) => ui.find({ type: 'Text', text: '[ ✦ Gain check ]' })
+const bandColor = async (ui: any) => {
+  const face = await bandFace(ui)
+  expect(face).toBeDefined()
+
+  return face.props.color
+}
+
+test('the button is white when nothing is going on', async ($: any, on: any) => {
+  engine(on)
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the button is green while a check is working, and the words beside it match', async ($: any, on: any) => {
+  engine(on, { seed: [running('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBe('success')
+  expect((await ui.find({ type: 'Text', text: /Checking/ }))?.props.color).toBe('success')
+  await ui.unmount()
+})
+
+test('working wins: an unread answer stays out of the way until nothing is running', async ($: any, on: any) => {
+  engine(on, { seed: [done('c1', 'First'), running('c2', 'Second')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBe('success')
+  await ui.unmount()
+})
+
+test('the button is yellow while an answer waits for you, and white once you open it', async ($: any, on: any) => {
+  engine(on, { seed: [done('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBe('warning')
+  expect((await ui.find({ type: 'Text', text: /Answer ready/ }))?.props.color).toBe('warning')
+  await ui.press({ key: 'gain-open' })
+  await ui.unmount()
+
+  const after = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await bandColor(after)).toBeUndefined()
+  await after.unmount()
+})
+
+test('the button goes back to white once you move on without opening the answer', async ($: any, on: any) => {
+  engine(on, { seed: [done('c1', 'First')] })
+  await boot($)
+  await $.prompt.submit(person)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a stopped check leaves the button white', async ($: any, on: any) => {
+  engine(on, { seed: [running('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'gain-stop-all' })
+  await ui.unmount()
+
+  const after = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await bandColor(after)).toBeUndefined()
+  await after.unmount()
+})
+
+test('a check that never reported back cannot leave the button green forever', async ($: any, on: any) => {
+  engine(on, { seed: [{ ...running('c1', 'First'), startedAt: -2_000_000 }] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  expect(await bandColor(ui)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a green button still does its job when pressed', async ($: any, on: any) => {
+  const { spawned } = engine(on, { selection: 'Ship on Friday', seed: [running('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+
+  await ui.press({ key: 'gain-band' })
+
+  expect(spawned[0].prompt).toContain('Ship on Friday')
+  await ui.unmount()
+})
+
+test('a surface with its own button chrome gets no drawn brackets', async ($: any, on: any) => {
+  engine(on, { seed: [running('c1', 'First')] })
+  await boot($)
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+
+  expect((await ui.find({ type: 'Text', text: '✦ Gain check' }))?.props.color).toBe('success')
+  expect(await bandFace(ui)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a running check reads green on its card and in the pane too', async ($: any, on: any) => {
+  engine(on, { seed: [running('c1', 'First')] })
+  await boot($)
+
+  const card = await $.ui.mount({
+    plugin: 'gain-check',
+    component: 'Placed',
+    requestId: 'card-c1',
+    props: { id: 'card-c1', plugin: 'gain-check' },
+    surface: 'terminal',
+  })
+  expect((await card.find({ type: 'Text', text: /◐/ }))?.props.color).toBe('success')
+  await card.unmount()
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await pane.find({ type: 'Text', text: /Checking…/ }))?.props.color).toBe('success')
+  await pane.unmount()
+})

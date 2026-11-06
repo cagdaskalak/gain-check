@@ -319,7 +319,7 @@ const statusMark = (c: GainCheck) =>
   c.status === 'running' ? '◐' : c.status === 'done' ? '✓' : c.status === 'stopped' ? '■' : '×'
 
 const statusColor = (c: GainCheck) =>
-  c.status === 'running' ? 'warning' : c.status === 'done' ? 'claude' : c.status === 'stopped' ? 'subtle' : 'error'
+  c.status === 'running' ? 'success' : c.status === 'done' ? 'claude' : c.status === 'stopped' ? 'subtle' : 'error'
 
 // A tick box, wide enough to see and hit. A terminal can't draw one character larger.
 const box = (isOn: boolean) => (isOn ? '[✓]' : '[ ]')
@@ -381,9 +381,9 @@ const drawAnswer = (t: Table, c: GainCheck, spentText: string) => {
   if (c.status === 'running') {
     return frame(
       t,
-      'warning',
+      'success',
       <Box flexDirection="column">
-        <Text bold color="warning">◐ Checking…</Text>
+        <Text bold color="success">◐ Checking…</Text>
         <Text>{c.subject}</Text>
         <Text dimColor>This usually takes 1 to 4 minutes. You can keep working.</Text>
       </Box>,
@@ -665,20 +665,27 @@ export const register: Register = on => {
     const { estimate, perUsd, percentUsed } = await estimateNow($)
     const shown = await displayNow($)
     const costed = costText(estimate, perUsd, shown)
+    // The button says where things stand: green, a check is working; yellow, an answer
+    // is waiting for you; no colour, nothing is going on.
+    const tone = live.length > 0 ? 'success' : isReady ? 'warning' : undefined
+    // A terminal's own button would keep its brackets white, so it draws them itself.
+    const face = e.surface === 'terminal' ? '[ ✦ Gain check ]' : '✦ Gain check'
 
     return (
       <Box>
         <Button
           key="gain-band"
-          label="✦ Gain check"
+          plain
           onPress={async () => {
             if (!(await checkSelection($))) {
               await refresh($)
               await $.ui.open({ id: PANE, title: TITLE })
             }
           }}
-        />
-        {live.length > 0 && <Text color="warning"> ◐ Checking{live.length > 1 ? ` ${live.length}` : ''}… </Text>}
+        >
+          <Text bold color={tone}>{face}</Text>
+        </Button>
+        {live.length > 0 && <Text color={tone}> ◐ Checking{live.length > 1 ? ` ${live.length}` : ''}… </Text>}
         {live.length > 0 && (
           <Button
             key="gain-stop-all"
@@ -690,7 +697,7 @@ export const register: Register = on => {
             }}
           />
         )}
-        {live.length === 0 && isReady && <Text color="success"> ✓ Answer ready </Text>}
+        {live.length === 0 && isReady && <Text color={tone}> ✓ Answer ready </Text>}
         {live.length === 0 && isReady && (
           <Button key="gain-open" label="Open" onPress={() => openCheck($, latestDone.id)} />
         )}

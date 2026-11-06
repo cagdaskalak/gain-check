@@ -38,6 +38,12 @@ Each check gets a card in the chat. Click it to open the full answer in the side
 
 Pressing the same thing twice never runs it twice, and a finished answer opens again without paying for it. Up to 6 checks run at once.
 
+The `Gain check` button tells you where things stand at a glance:
+
+- **Green:** a check is working.
+- **Yellow:** an answer is ready and waiting for you. Opening it, or sending your next message, clears this.
+- **White:** nothing is going on.
+
 ## It follows where you are
 
 Once a decision is made, it stops taking up your screen. An answered question leaves the list, along with any finished check on it. Your next message does the same for other finished checks, and the list only offers your latest message and what follows. Nothing is deleted: `Past checks` in the side pane brings them back, because you paid for those answers, and a past check's card in the chat shrinks to one line you can still click.
